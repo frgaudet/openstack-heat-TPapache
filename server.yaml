@@ -1,0 +1,191 @@
+heat_template_version: 2014-10-16
+
+description: Deploy a TP instance
+
+parameters:
+  index:
+    type: number
+    description: Occurence number
+  key_name:
+    type: string
+    default: fgaudet-key
+    description: Name of key-pair to be used for the default user
+  flavor:
+    type: string
+    default: q1.tiny
+    description: |
+      Choose an instance flavor
+  image_id:
+    type: string
+    default: Ubuntu Server 16.04 LTS (xenial)
+    label: Server image
+  net_id:
+    type: string
+    label: Network ID
+    default: tp-net
+    description: ID of the network to use
+  name:
+    type: string
+    description: Name of each TP machine booted
+  public_network:
+    type: string
+    default: ext-publicnet
+    description: Public network id
+  users:
+    type: string
+    description: List of students (json data structure wrote as string... just to fool heat)
+
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      count: 1
+      timeout: 600
+ 
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+  server_init:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: {get_resource: shell_script_init}
+      - config: {get_resource: cloud_init}  
+
+  cloud_init:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        manage_etc_hosts: true
+        timezone: Europe/Paris
+
+  shell_script_init:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config:
+        str_replace:
+          params:
+            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+            users: { get_param: users }
+            index: { get_param: index }
+          template: |
+            #!/bin/bash
+
+            yell() { echo "$0: $*" >&2; }
+            die() { yell "$*"; exit 1; }
+            try() { "$@" || die "cannot $*"; }
+            asuser() { sudo su - "$1" bash -c '$2'; }
+
+            # Update package lists
+            echo "Wait for upgrade to finish"
+            sleep 5
+            while  [[  `/bin/fuser /var/lib/dpkg/lock` ]] ||  [[ `/bin/fuser /var/lib/apt/lists/lock` ]] ; do
+                sleep 2
+            done
+            try apt-get update
+
+            # Preseed configuration
+            echo exim4-config exim4/dc_smarthost string "smtp.univ-bpclermont.fr" | debconf-set-selections
+            echo exim4-config exim4/dc_eximconfig_configtype select "mail sent by smarthost; no local mail" | debconf-set-selections
+            
+            # Upgrade
+            while  [[  `/bin/fuser /var/lib/dpkg/lock` ]] ||  [[ `/bin/fuser /var/lib/apt/lists/lock` ]] ; do
+                sleep 2
+            done
+            DEBIAN_FRONTEND=noninteractive try apt-get -y install exim4 mailutils python-minimal jq mutt
+
+            # Reach out student names
+            data='users'
+            __username__=$(echo $data | jq -r '.students[index].name')
+            __email__=$(echo $data | jq -r '.students[index].email')
+
+            # Add user
+            try useradd -m $__username__ -G sudo -s /bin/bash
+            __password__=$(date | md5sum | head -c15)
+            try echo $__username__:${__password__} | /usr/sbin/chpasswd
+
+            # Give user root capabilities
+            cat >> /etc/ssh/sshd_config << EOF
+            Match User $__username__
+              PasswordAuthentication yes
+            EOF
+            try systemctl restart ssh
+
+            # Find out public IP
+            my_ip=$(try curl -s http://whatismyip.akamai.com/)
+
+            # Send credentials to the user
+            try echo "
+            Bonjour,
+
+            Voici vos identifiants pour l'acces au TD Apache du lundi 20 novembre : 
+
+            Adresse IP : $my_ip
+
+            login: $__username__ 
+
+            password : $__password__
+
+            Cordialement,
+
+            F-Gaudet
+            " | mutt -s "$(hostname) instance credentials" -c frederic.gaudet@isima.fr -e "unmy_hdr from; my_hdr From:gaudet@isima.fr" -e "set realname=\"Frederic Gaudet\"  " $__email__
+
+            #try echo -e "Utilisateur : $__username__ \n Password : $__password__ \n Adresse IP : $my_ip \n Email : $__email__" | mail -s "$(hostname) instance credentials" gaudet@isima.fr
+
+            # Notify Heat we're done
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+
+  tp_server:
+    type: OS::Nova::Server
+    properties:
+      key_name: { get_param: key_name }
+      name: { get_param: name }
+      image: { get_param: image_id }
+      networks:
+        - port: { get_resource: tp_port }
+      flavor: { get_param: flavor }
+      user_data_format: RAW
+      user_data:
+          get_resource: server_init
+
+  tp_security_group:
+        type: OS::Neutron::SecurityGroup
+        properties:
+          name: SG_TP_Apache
+          rules:
+            - protocol: tcp
+              port_range_min: 80
+              port_range_max: 80
+            - protocol: tcp
+              port_range_min: 443
+              port_range_max: 443
+
+  tp_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: net_id }
+      security_groups:
+        - default
+        - { get_resource: tp_security_group }
+
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_network }
+
+  floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: floating_ip }
+      port_id: { get_resource: tp_port }
+
+outputs:
+  name:
+    description: Name of this TP instance.
+    value: { get_attr: [tp_server, name] }
+  ip:
+    description: The floating IP address of this TP instance.
+    value: { get_attr: [floating_ip, floating_ip_address] }
